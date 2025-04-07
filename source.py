@@ -14,7 +14,7 @@ class KnowledgeBaseGenerator:
         self.knowledge_base = {}
         self.visited_urls = set()
         self.output_file = output_file
-        self.max_pages_per_domain = max_pages_per_domain
+        self.max_pages_per_domain = max_pages_per_domain  # Now represents content page limit
         self.delay = delay  # Delay between requests in seconds
         self.robot_parsers = {}  # Cache for robot.txt parsers
         self.respect_robots = respect_robots  # Whether to respect robots.txt
@@ -81,16 +81,44 @@ class KnowledgeBaseGenerator:
         return url
 
     def clean_url(self, url):
-        """Clean the URL by removing tracking parameters and standardizing"""
+        """Clean the URL by removing tracking and unnecessary parameters"""
         # Parse the URL
         parsed_url = urllib.parse.urlparse(url)
+        
+        # For alz.org, completely strip all query parameters as they're duplicates
+        if parsed_url.netloc == "www.alz.org":
+            clean_url = urllib.parse.urlunparse((
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                parsed_url.params,
+                '',  # No query
+                ''   # No fragment
+            ))
+            return clean_url
+        
+        # For WebMD, preserve pagination parameters but remove others
+        if parsed_url.netloc == "www.webmd.com":
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            # Keep only pagination parameters
+            filtered_params = {k: v for k, v in query_params.items() if k == 'pg'}
+            filtered_query = urllib.parse.urlencode(filtered_params, doseq=True)
+            
+            clean_url = urllib.parse.urlunparse((
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                parsed_url.params,
+                filtered_query,
+                ''  # No fragment
+            ))
+            return clean_url
         
         # List of common tracking parameters to remove
         tracking_params = [
             'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
             'fbclid', 'gclid', 'msclkid', 'ref', 'source', 'intcmp', 'cmp', 'mc_cid', 
-            'mc_eid', 'sb_referer_host', '_hsenc', '_hsmi', '_ga', 
-            '_disease', '_resource'  # Add specific parameters from the site
+            'mc_eid', 'sb_referer_host', '_hsenc', '_hsmi', '_ga', 'form', 'lang'
         ]
         
         # Parse query parameters
@@ -102,14 +130,11 @@ class KnowledgeBaseGenerator:
         # Rebuild the query string
         filtered_query = urllib.parse.urlencode(filtered_params, doseq=True)
         
-        # Standardize URL by removing trailing slash and query parameters
-        normalized_path = parsed_url.path.rstrip('/')
-        
         # Rebuild the URL
         clean_url = urllib.parse.urlunparse((
             parsed_url.scheme,
             parsed_url.netloc,
-            normalized_path,
+            parsed_url.path,
             parsed_url.params,
             filtered_query,
             ''  # No fragment
@@ -117,19 +142,132 @@ class KnowledgeBaseGenerator:
         
         return clean_url
 
-    def is_same_url(self, url1, url2):
-        """Check if two URLs are essentially the same"""
-        try:
-            clean_url1 = self.clean_url(url1)
-            clean_url2 = self.clean_url(url2)
-            return clean_url1 == clean_url2
-        except:
-            return url1 == url2
-
     def is_internal_link(self, url, base_domain):
         """Check if the URL is an internal link (same domain)"""
         url_domain = self.get_domain(url)
         return url_domain == base_domain or url_domain == f"www.{base_domain}" or f"www.{url_domain}" == base_domain
+
+    def site_specific_content_extraction(self, soup, url):
+        """Apply site-specific content extraction based on website analysis"""
+        domain = self.get_domain(url)
+        
+        # Get specific content container based on domain
+        main_content = None
+        
+        if domain == "www.caregiveraction.org":
+            # For caregiveraction.org, content is in #main or #content
+            main_content = soup.find(id="main") or soup.find(id="content")
+            
+        elif domain == "www.asaging.org":
+            # For asaging.org, content is in .content .block-content
+            content_elements = soup.select(".content .block-content, .content .content-full")
+            if content_elements:
+                main_content = content_elements[0]
+                
+        elif domain == "www.webmd.com":
+            # For webmd.com, content is in #global-main
+            main_content = soup.find(id="global-main") or soup.select_one(".resp-2-col-rr, .article.medref")
+            
+        elif domain == "www.aarp.org":
+            # For aarp.org, content is in complex nested containers
+            main_content = soup.select_one(".uxdia-o-article-rail") or soup.select_one(".container .responsivegrid")
+            
+        elif domain == "www.nia.nih.gov":
+            # For nia.nih.gov, content is in .main-content .clearfix
+            main_content = soup.select_one(".main-content .clearfix") or soup.find(id="main-content")
+            
+        elif domain == "www.alz.org":
+            # For alz.org, content is in .tab-content or #content
+            main_content = soup.select_one(".tab-content") or soup.find(id="content")
+            
+        elif domain == "www.ncoa.org":
+            # For ncoa.org, content is in #content
+            main_content = soup.find(id="content") or soup.select_one(".styles_container__HFOo5")
+            
+        elif domain == "www.seniorliving.org":
+            # For seniorliving.org, content is in .main-content
+            main_content = soup.select_one(".main-content")
+        
+        return main_content
+
+    def site_specific_link_filtering(self, links, base_domain):
+        """Apply site-specific link filtering based on website analysis"""
+        content_links = []
+        other_links = []
+        
+        for link in links:
+            href = link['href'].strip()
+            
+            # Skip empty links and javascript
+            if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
+                continue
+                
+            lower_href = href.lower()
+            
+            # Site-specific filtering
+            if base_domain == "www.caregiveraction.org":
+                # Prioritize toolbox content first, then other content sections
+                if '/toolbox/' in lower_href:
+                    content_links.insert(0, href)  # Insert at the beginning to prioritize
+                elif any(pattern in lower_href for pattern in ['/corporate-partners/', '/caregiver-story/', '/guide/', '/blueprint-', '/hipaa-', '/stroke', '/traumatic-brain-injury/', '/ptsd/', '/lighting-your-way/']):
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            elif base_domain == "www.asaging.org":
+                # Most links are content
+                content_links.append(href)
+                
+            elif base_domain == "www.webmd.com":
+                # Prioritize a-to-z-guides, diet/news, guide
+                if any(pattern in lower_href for pattern in ['/a-to-z-guides/', '/diet/news/', '/guide/']):
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            elif base_domain == "www.aarp.org":
+                # Prioritize caregiving content
+                if '/caregiving/' in lower_href:
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            elif base_domain == "www.nia.nih.gov":
+                # Prioritize research content
+                if '/research/' in lower_href:
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            elif base_domain == "www.alz.org":
+                # Prioritize blog and help-support
+                if any(pattern in lower_href for pattern in ['/blog/', '/help-support/']):
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            elif base_domain == "www.ncoa.org":
+                # Prioritize older-adults content
+                if '/older-adults/' in lower_href or '/caregivers/' in lower_href:
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            elif base_domain == "www.seniorliving.org":
+                # Most content is articles
+                if any(pattern in lower_href for pattern in ['/care/', '/health/', '/finance/']):
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+                    
+            else:
+                # Default behavior for other domains
+                if any(content_word in lower_href for content_word in ['article', 'post', 'blog', 'news', 'resource']):
+                    content_links.append(href)
+                else:
+                    other_links.append(href)
+        
+        return content_links, other_links
 
     def extract_text_with_structure(self, soup, url=""):
         """Extract text content with structural information, focusing on main content"""
@@ -157,24 +295,26 @@ class KnowledgeBaseGenerator:
         if meta_desc and meta_desc.get('content'):
             content["meta_description"] = meta_desc['content'].strip()
         
-        # Try to find the main content area
-        main_content = None
+        # Get site-specific content container
+        main_content = self.site_specific_content_extraction(soup, url)
         
-        # Look for common content containers
-        content_containers = [
-            soup.find('article'),
-            soup.find(id=re.compile(r'(content|main|article|post)', re.I)),
-            soup.find(class_=re.compile(r'(content|main|article|post)', re.I)),
-            soup.find('main'),
-            soup.find(attrs={"role": "main"}),
-            soup.find(attrs={"itemprop": "articleBody"})
-        ]
-        
-        # Use the first valid container found
-        for container in content_containers:
-            if container:
-                main_content = container
-                break
+        # If no specific content found, use the standard approach
+        if not main_content:
+            # Look for common content containers
+            content_containers = [
+                soup.find('article'),
+                soup.find(id=re.compile(r'(content|main|article|post)', re.I)),
+                soup.find(class_=re.compile(r'(content|main|article|post)', re.I)),
+                soup.find('main'),
+                soup.find(attrs={"role": "main"}),
+                soup.find(attrs={"itemprop": "articleBody"})
+            ]
+            
+            # Use the first valid container found
+            for container in content_containers:
+                if container:
+                    main_content = container
+                    break
         
         # If no main content found, use the whole body
         if not main_content:
@@ -376,14 +516,12 @@ class KnowledgeBaseGenerator:
 
     def crawl_page(self, url, base_url, base_domain, depth=0):
         """Crawl a single page and extract knowledge"""
-        # Clean URL by removing tracking parameters and standardizing
+        # Clean URL by removing tracking parameters
         clean_url = self.clean_url(url)
         
-        # Check for URL repetition
-        for visited_url in self.visited_urls:
-            if self.is_same_url(clean_url, visited_url):
-                return
-        
+        if clean_url in self.visited_urls:
+            return
+            
         # Use the clean URL for processing
         url = clean_url
         
@@ -406,9 +544,9 @@ class KnowledgeBaseGenerator:
             # Add delay to be respectful
             time.sleep(self.delay)
             
-            # Rotate User-Agent
+            # Send request with a realistic user agent
             headers = {
-                'User-Agent': random.choice(self.user_agents),
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': base_url,
@@ -417,27 +555,23 @@ class KnowledgeBaseGenerator:
                 'Upgrade-Insecure-Requests': '1',
             }
             
-            # Send request with more robust error handling
-            try:
-                response = requests.get(url, headers=headers, timeout=10)
-                response.raise_for_status()  # Raise an exception for bad status codes
-            except requests.exceptions.RequestException as e:
-                print(f"Request error for {url}: {e}")
-                self.error_urls.append({"url": url, "error": str(e)})
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code != 200:
+                error_msg = f"Failed to fetch {url}: Status code {response.status_code}"
+                print(error_msg)
+                self.error_urls.append({"url": url, "error": error_msg, "status_code": response.status_code})
                 self.stats["errors"] += 1
                 return
             
-            # Check content type
-            content_type = response.headers.get('Content-Type', '').lower()
-            if 'text/html' not in content_type:
+            content_type = response.headers.get('Content-Type', '')
+            if 'text/html' not in content_type.lower():
                 print(f"Skipping non-HTML content: {url}")
                 self.stats["pages_skipped"] += 1
                 return
             
-            # Parse HTML
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Classify the page with enhanced content analysis
+            # Classify the page with content analysis
             page_type = self.classify_page(url, base_url, soup)
             
             # Skip pages that aren't content-rich unless they're the homepage (if content_only is enabled)
@@ -477,23 +611,23 @@ class KnowledgeBaseGenerator:
             # Update statistics
             self.stats["pages_crawled"] += 1
             self.knowledge_base[domain]["stats"]["pages_crawled"] += 1
-
+            
             # Update page type statistics
             if page_type not in self.knowledge_base[domain]["stats"]["by_type"]:
                 self.knowledge_base[domain]["stats"]["by_type"][page_type] = 0
             self.knowledge_base[domain]["stats"]["by_type"][page_type] += 1
-
+            
             # Calculate content page count
             content_pages_count = sum(
                 count for p_type, count in self.knowledge_base[domain]["stats"]["by_type"].items() 
                 if p_type.lower() in self.content_page_types
             )
-
+            
             if page_type.lower() in self.content_page_types:
                 print(f"Crawled {url} (Type: {page_type}) [Content page {content_pages_count}/{self.max_pages_per_domain}]")
             else:
                 print(f"Crawled {url} (Type: {page_type})")
-
+            
             # Check if we should continue crawling this domain
             if not self.should_crawl_domain(domain):
                 # Count content pages
@@ -508,12 +642,11 @@ class KnowledgeBaseGenerator:
                     print(f"Reached maximum total pages while searching for content for domain {domain}")
                 return
             
-            # Find links to crawl next (with enhanced filtering)
+            # Find links to crawl next
             links = soup.find_all('a', href=True)
             
-            # Modified link filtering strategy
-            content_links = []
-            other_links = []
+            # Apply site-specific link filtering
+            content_links, other_links = [], []
             
             for link in links:
                 href = link['href'].strip()
@@ -525,263 +658,330 @@ class KnowledgeBaseGenerator:
                 # Normalize URL
                 next_url = self.normalize_url(href, url)
                 
-                # Skip already processed URLs
-                clean_next_url = self.clean_url(next_url)
-                if any(self.is_same_url(clean_next_url, visited_url) for visited_url in self.visited_urls):
+                # Skip already visited URLs
+                if next_url in self.visited_urls:
                     continue
                 
-                # Only follow internal links with more specific filtering
+                # Only follow internal links
                 if self.is_internal_link(next_url, base_domain):
-                    # Classify link from URL (without fetching)
-                    link_type = self.classify_page(next_url, base_url)
+                    lower_href = next_url.lower()
                     
-                    # More sophisticated link prioritization
-                    if link_type.lower() in self.content_page_types:
-                        content_links.append(next_url)
-                    elif link_type.lower() not in self.avoid_page_types:
-                        other_links.append(next_url)
-            
-            # Crawl content-rich links first
-            for next_url in content_links:
-                if self.should_crawl_domain(domain):
-                    self.crawl_page(next_url, base_url, base_domain, depth + 1)
-            
-            # Then crawl other potentially useful links
-            for next_url in other_links:
-                if self.should_crawl_domain(domain):
-                    self.crawl_page(next_url, base_url, base_domain, depth + 1)
-            
-        except Exception as e:
-            error_msg = f"Unexpected error crawling {url}: {str(e)}"
-            print(error_msg)
-            self.error_urls.append({"url": url, "error": error_msg, "exception": str(e)})
-            self.stats["errors"] += 1
-    
-    def crawl_website(self, url):
-        """Crawl a website starting from the given URL"""
-        # Normalize the starting URL
-        if not url.endswith('/'):
-            url += '/'
-        
-        start_time = time.time()
-        print(f"\n{'='*50}")
-        print(f"Starting crawl of {url}")
-        print(f"{'='*50}")
-        
-        parsed_url = urllib.parse.urlparse(url)
-        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        base_domain = self.get_domain(url)
-        
-        # Reset domain-specific stats
-        if base_domain in self.knowledge_base:
-            self.knowledge_base[base_domain]["stats"] = {
-                "pages_crawled": 0,
-                "by_type": {}
-            }
-        
-        self.crawl_page(url, base_url, base_domain, depth=0)
-        
-        end_time = time.time()
-        elapsed = end_time - start_time
-        
-        print(f"\n{'='*50}")
-        print(f"Completed crawl of {url}")
-        print(f"Time elapsed: {elapsed:.2f} seconds")
-        if base_domain in self.knowledge_base:
-            pages_crawled = self.knowledge_base[base_domain]["stats"]["pages_crawled"]
-            print(f"Pages crawled: {pages_crawled}")
-            
-            if "by_type" in self.knowledge_base[base_domain]["stats"]:
-                print("Pages by type:")
-                for page_type, count in self.knowledge_base[base_domain]["stats"]["by_type"].items():
-                    print(f"  - {page_type}: {count}")
-        print(f"{'='*50}\n")
-        
-        return self.knowledge_base.get(base_domain, {})
-    
-    def crawl_websites(self, urls):
-        """Crawl multiple websites"""
-        for url in urls:
-            self.crawl_website(url)
-        
-        # Post-process the knowledge base
-        self.remove_duplicate_content()
-            
-        # Save the knowledge base
-        self.save_knowledge_base()
-        
-        return self.knowledge_base
-    
-    def save_knowledge_base(self):
-        """Save the knowledge base to a JSON file"""
-        with open(self.output_file, 'w', encoding='utf-8') as f:
-            json.dump(self.knowledge_base, f, indent=2, ensure_ascii=False)
-        
-        print(f"Knowledge base saved to {self.output_file}")
-    
-    def add_metadata(self):
-        """Add metadata about the crawl to the knowledge base"""
-        total_errors = len(self.error_urls)
-        
-        metadata = {
-            "generator": "KnowledgeBaseGenerator",
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "statistics": {
-                "total_domains": len(self.knowledge_base) - (1 if "_metadata" in self.knowledge_base else 0),
-                "total_pages": sum(len(domain_data["pages"]) for domain_data in self.knowledge_base.values() if isinstance(domain_data, dict) and "pages" in domain_data),
-                "pages_crawled": self.stats["pages_crawled"],
-                "pages_skipped": self.stats["pages_skipped"],
-                "errors": self.stats["errors"]
-            },
-            "errors": self.error_urls[:100]  # Include up to 100 errors for debugging
-        }
-        
-        self.knowledge_base["_metadata"] = metadata
-    
-    def remove_duplicate_content(self):
-        """Remove duplicate paragraphs and content across pages"""
-        # Track paragraphs by hash to identify duplicates
-        paragraph_hashes = {}
-        duplicates_removed = 0
-        
-        # Process each domain
-        for domain, domain_data in self.knowledge_base.items():
-            if domain == "_metadata":
-                continue
-                
-            for url, page_data in domain_data["pages"].items():
-                if "content" in page_data and "paragraphs" in page_data["content"]:
-                    unique_paragraphs = []
-                    
-                    for paragraph in page_data["content"]["paragraphs"]:
-                        # Generate a hash of the paragraph text (after normalization)
-                        # Normalize by lowercasing and removing extra whitespace
-                        normalized_text = re.sub(r'\s+', ' ', paragraph.lower()).strip()
-                        text_hash = hashlib.md5(normalized_text.encode()).hexdigest()
-                        
-                        # Only keep paragraphs we haven't seen before in this page
-                        if text_hash not in paragraph_hashes:
-                            paragraph_hashes[text_hash] = url
-                            unique_paragraphs.append(paragraph)
-                        elif paragraph_hashes[text_hash] != url:
-                            # This is a true duplicate (across different pages)
-                            # We still include it in the current page
-                            unique_paragraphs.append(paragraph)
+                    # Site-specific filtering
+                    if base_domain == "www.caregiveraction.org":
+                        # Prioritize toolbox content first, then other content sections
+                        if '/toolbox/' in lower_href:
+                            content_links.insert(0, next_url)  # Insert at the beginning to prioritize
+                        elif any(pattern in lower_href for pattern in ['/corporate-partners/', '/caregiver-story/', '/guide/', '/blueprint-', '/hipaa-', '/stroke', '/traumatic-brain-injury/', '/ptsd/', '/lighting-your-way/']):
+                            content_links.append(next_url)
                         else:
-                            # This is a duplicate within the same page
-                            duplicates_removed += 1
-                    
-                    # Update page with unique paragraphs
-                    page_data["content"]["paragraphs"] = unique_paragraphs
-        
-        print(f"Removed {duplicates_removed} duplicate paragraphs within pages")
-    
+                            other_links.append(next_url)
+                            
+                    elif base_domain == "www.asaging.org":
+                        # Most links are content
+                        content_links.append(next_url)
+                        
+                    elif base_domain == "www.webmd.com":
+                        # Prioritize a-to-z-guides, diet/news, guide
+                        if any(pattern in lower_href for pattern in ['/a-to-z-guides/', '/diet/news/', '/guide/']):
+                            content_links.append(next_url)
+                        else:
+                            other_links.append(next_url)
+                            
+                    elif base_domain == "www.aarp.org":
+                        # Prioritize caregiving content
+                        if '/caregiving/' in lower_href:
+                            content_links.append(next_url)
+                        else:
+                            other_links.append(next_url)
+                            
+                    elif base_domain == "www.nia.nih.gov":
+                        # Prioritize research content
+                        if '/research/' in lower_href:
+                            content_links.append(next_url)
+                        else:
+                            other_links.append(next_url)
+                            
+                    elif base_domain == "www.alz.org":
+                        # Prioritize blog and help-support
+                        if any(pattern in lower_href for pattern in ['/blog/', '/help-support/']):
+                            content_links.append(next_url)
+                        else:
+                            other_links.append(next_url)
+                            
+                    elif base_domain == "www.ncoa.org":
+                        # Prioritize older-adults content
+                        if '/older-adults/' in lower_href or '/caregivers/' in lower_href:
+                            content_links.append(next_url)
+                        else:
+                            other_links.append(next_url)
+
+                    elif base_domain == "www.seniorliving.org":
+                       # Most content is articles
+                       if any(pattern in lower_href for pattern in ['/care/', '/health/', '/finance/']):
+                           content_links.append(next_url)
+                       else:
+                           other_links.append(next_url)
+                           
+                    else:
+                       # Default behavior for other domains
+                       if any(content_word in lower_href for content_word in ['article', 'post', 'blog', 'news', 'resource']):
+                           content_links.append(next_url)
+                       else:
+                           other_links.append(next_url)
+           
+           # Crawl content-rich links first
+            for next_url in content_links:
+               if self.should_crawl_domain(domain):
+                   self.crawl_page(next_url, base_url, base_domain, depth + 1)
+           
+           # Then crawl other potentially useful links
+            for next_url in other_links:
+               if self.should_crawl_domain(domain):
+                   self.crawl_page(next_url, base_url, base_domain, depth + 1)
+           
+        except Exception as e:
+           error_msg = f"Error crawling {url}: {str(e)}"
+           print(error_msg)
+           self.error_urls.append({"url": url, "error": error_msg, "exception": str(e)})
+           self.stats["errors"] += 1
+   
+    def crawl_website(self, url):
+       """Crawl a website starting from the given URL"""
+       # Normalize the starting URL
+       if not url.endswith('/'):
+           url += '/'
+       
+       start_time = time.time()
+       print(f"\n{'='*50}")
+       print(f"Starting crawl of {url}")
+       print(f"{'='*50}")
+       
+       parsed_url = urllib.parse.urlparse(url)
+       base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+       base_domain = self.get_domain(url)
+       
+       # Reset domain-specific stats
+       if base_domain in self.knowledge_base:
+           self.knowledge_base[base_domain]["stats"] = {
+               "pages_crawled": 0,
+               "by_type": {}
+           }
+       
+       self.crawl_page(url, base_url, base_domain, depth=0)
+       
+       end_time = time.time()
+       elapsed = end_time - start_time
+       
+       print(f"\n{'='*50}")
+       print(f"Completed crawl of {url}")
+       print(f"Time elapsed: {elapsed:.2f} seconds")
+       
+       if base_domain in self.knowledge_base:
+           pages_crawled = self.knowledge_base[base_domain]["stats"]["pages_crawled"]
+           print(f"Pages crawled: {pages_crawled}")
+           
+           if "by_type" in self.knowledge_base[base_domain]["stats"]:
+               # Count content pages
+               content_pages = sum(
+                   count for p_type, count in self.knowledge_base[base_domain]["stats"]["by_type"].items() 
+                   if p_type.lower() in self.content_page_types
+               )
+               print(f"Content pages: {content_pages}/{self.max_pages_per_domain}")
+               
+               print("Pages by type:")
+               for page_type, count in self.knowledge_base[base_domain]["stats"]["by_type"].items():
+                   is_content = page_type.lower() in self.content_page_types
+                   print(f"  - {page_type}: {count}" + (" (content)" if is_content else ""))
+                   
+       print(f"{'='*50}\n")
+       
+       return self.knowledge_base.get(base_domain, {})
+   
+    def crawl_websites(self, urls):
+       """Crawl multiple websites"""
+       for url in urls:
+           self.crawl_website(url)
+       
+       # Post-process the knowledge base
+       self.remove_duplicate_content()
+           
+       # Save the knowledge base
+       self.save_knowledge_base()
+       
+       return self.knowledge_base
+   
+    def save_knowledge_base(self):
+       """Save the knowledge base to a JSON file"""
+       with open(self.output_file, 'w', encoding='utf-8') as f:
+           json.dump(self.knowledge_base, f, indent=2, ensure_ascii=False)
+       
+       print(f"Knowledge base saved to {self.output_file}")
+   
+    def add_metadata(self):
+       """Add metadata about the crawl to the knowledge base"""
+       total_errors = len(self.error_urls)
+       
+       metadata = {
+           "generator": "KnowledgeBaseGenerator",
+           "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "statistics": {
+               "total_domains": len(self.knowledge_base) - (1 if "_metadata" in self.knowledge_base else 0),
+               "total_pages": sum(len(domain_data["pages"]) for domain_data in self.knowledge_base.values() if isinstance(domain_data, dict) and "pages" in domain_data),
+               "pages_crawled": self.stats["pages_crawled"],
+               "pages_skipped": self.stats["pages_skipped"],
+               "errors": self.stats["errors"]
+           },
+           "errors": self.error_urls[:100]  # Include up to 100 errors for debugging
+       }
+       
+       self.knowledge_base["_metadata"] = metadata
+   
+    def remove_duplicate_content(self):
+       """Remove duplicate paragraphs and content across pages"""
+       # Track paragraphs by hash to identify duplicates
+       paragraph_hashes = {}
+       duplicates_removed = 0
+       
+       # Process each domain
+       for domain, domain_data in self.knowledge_base.items():
+           if domain == "_metadata":
+               continue
+               
+           for url, page_data in domain_data["pages"].items():
+               if "content" in page_data and "paragraphs" in page_data["content"]:
+                   unique_paragraphs = []
+                   
+                   for paragraph in page_data["content"]["paragraphs"]:
+                       # Generate a hash of the paragraph text (after normalization)
+                       # Normalize by lowercasing and removing extra whitespace
+                       normalized_text = re.sub(r'\s+', ' ', paragraph.lower()).strip()
+                       text_hash = hashlib.md5(normalized_text.encode()).hexdigest()
+                       
+                       # Only keep paragraphs we haven't seen before in this page
+                       if text_hash not in paragraph_hashes:
+                           paragraph_hashes[text_hash] = url
+                           unique_paragraphs.append(paragraph)
+                       elif paragraph_hashes[text_hash] != url:
+                           # This is a true duplicate (across different pages)
+                           # We still include it in the current page
+                           unique_paragraphs.append(paragraph)
+                       else:
+                           # This is a duplicate within the same page
+                           duplicates_removed += 1
+                   
+                   # Update page with unique paragraphs
+                   page_data["content"]["paragraphs"] = unique_paragraphs
+       
+       print(f"Removed {duplicates_removed} duplicate paragraphs within pages")
+   
     def generate_categories(self):
-        """Generate a categorical view of the knowledge base"""
-        categorical = defaultdict(lambda: defaultdict(list))
-        
-        for domain, domain_data in self.knowledge_base.items():
-            if domain == "_metadata":
-                continue
-                
-            for url, page_data in domain_data["pages"].items():
-                page_type = page_data["type"]
-                title = page_data["content"]["title"]
-                categorical[domain][page_type].append({
-                    "url": url,
-                    "title": title
-                })
-        
-        categorical_file = os.path.splitext(self.output_file)[0] + "_categories.json"
-        with open(categorical_file, 'w', encoding='utf-8') as f:
-            json.dump(categorical, f, indent=2, ensure_ascii=False)
-        
-        print(f"Categorical view saved to {categorical_file}")
+       """Generate a categorical view of the knowledge base"""
+       categorical = defaultdict(lambda: defaultdict(list))
+       
+       for domain, domain_data in self.knowledge_base.items():
+           if domain == "_metadata":
+               continue
+               
+           for url, page_data in domain_data["pages"].items():
+               page_type = page_data["type"]
+               title = page_data["content"]["title"]
+               categorical[domain][page_type].append({
+                   "url": url,
+                   "title": title
+               })
+       
+       categorical_file = os.path.splitext(self.output_file)[0] + "_categories.json"
+       with open(categorical_file, 'w', encoding='utf-8') as f:
+           json.dump(categorical, f, indent=2, ensure_ascii=False)
+       
+       print(f"Categorical view saved to {categorical_file}")
 
 
 def main():
-    # List of websites to crawl
-    websites = [
-        "https://www.caregiveraction.org/toolbox/",
-        "https://www.asaging.org/",
-        "https://www.webmd.com/",
-        "https://www.relias.com/",
-        "https://www.aarp.org/caregiving/",
-        "https://www.nia.nih.gov/",
-        "https://www.alz.org/",
-        "https://www.ncoa.org/",
-        "https://www.seniorliving.org/"
-    ]
-    
-    # Parse command line arguments
-    import argparse
-    parser = argparse.ArgumentParser(description='Knowledge Base Generator')
-    parser.add_argument('--output', '-o', type=str, default="caregiving_knowledge_base.json", help='Output JSON file')
-    parser.add_argument('--max-pages', '-m', type=int, default=50, help='Maximum pages per domain')
-    parser.add_argument('--delay', '-d', type=float, default=2.0, help='Delay between requests in seconds')
-    parser.add_argument('--ignore-robots', '-i', action='store_true', help='Ignore robots.txt (default: True, will ignore robots.txt)')
-    parser.add_argument('--respect-robots', '-r', action='store_true', help='Respect robots.txt')
-    parser.add_argument('--sites', '-s', nargs='+', help='Specific sites to crawl (instead of default list)')
-    parser.add_argument('--content-only', '-c', action='store_true', help='Crawl only content-rich pages (default: True)')
-    parser.add_argument('--all-pages', '-a', action='store_true', help='Crawl all page types, not just content-rich ones')
-    args = parser.parse_args()
-    
-    # Use command line arguments or default values
-    output_file = args.output
-    max_pages = args.max_pages
-    delay = args.delay
-    respect_robots = False if args.ignore_robots else False  # Default to False
-    site_list = args.sites if args.sites else websites
-    content_only = True  # Default to True
-    
-    # Update content_only based on command line arguments
-    if args.all_pages:
-        content_only = False
-        
-    # Update respect_robots based on command line arguments
-    if args.respect_robots:
-        respect_robots = True
-        
-    print(f"Knowledge Base Generator Configuration:")
-    print(f"  - Output file: {output_file}")
-    print(f"  - Max pages per domain: {max_pages}")
-    print(f"  - Request delay: {delay} seconds")
-    print(f"  - Respect robots.txt: {respect_robots}")
-    print(f"  - Sites to crawl: {len(site_list)}")
-    print(f"  - Content-only mode: {content_only}")
-    
-    start_time = time.time()
-    
-    # Create knowledge base generator
-    generator = KnowledgeBaseGenerator(
-        output_file=output_file,
-        max_pages_per_domain=max_pages,
-        delay=delay,
-        respect_robots=respect_robots,
-        content_only=content_only
-    )
-    
-    # Crawl websites
-    generator.crawl_websites(site_list)
-    
-    # Add metadata
-    generator.add_metadata()
-    
-    # Generate categorical view
-    generator.generate_categories()
-    
-    end_time = time.time()
-    total_time = end_time - start_time
-    minutes = int(total_time // 60)
-    seconds = int(total_time % 60)
-    
-    print(f"\nCrawling completed in {minutes} minutes and {seconds} seconds")
-    print(f"Total pages crawled: {generator.stats['pages_crawled']}")
-    print(f"Total pages skipped: {generator.stats['pages_skipped']}")
-    print(f"Total errors: {generator.stats['errors']}")
-    print(f"Knowledge base saved to: {output_file}")
-    print(f"Categorical view saved to: {os.path.splitext(output_file)[0] + '_categories.json'}")
+   # List of websites to crawl
+   websites = [
+       "https://www.caregiveraction.org/toolbox/",  # Start from Toolbox page
+       "https://www.asaging.org/",
+       "https://www.webmd.com/",
+       "https://www.relias.com/",
+       "https://www.aarp.org/caregiving/",
+       "https://www.nia.nih.gov/",
+       "https://www.alz.org/",
+       "https://www.ncoa.org/",
+       "https://www.seniorliving.org/"
+   ]
+   
+   # Parse command line arguments
+   import argparse
+   parser = argparse.ArgumentParser(description='Knowledge Base Generator')
+   parser.add_argument('--output', '-o', type=str, default="caregiving_knowledge_base.json", help='Output JSON file')
+   parser.add_argument('--max-pages', '-m', type=int, default=50, help='Maximum content-rich pages per domain')
+   parser.add_argument('--delay', '-d', type=float, default=2.0, help='Delay between requests in seconds')
+   parser.add_argument('--ignore-robots', '-i', action='store_true', help='Ignore robots.txt (default: True, will ignore robots.txt)')
+   parser.add_argument('--respect-robots', '-r', action='store_true', help='Respect robots.txt')
+   parser.add_argument('--sites', '-s', nargs='+', help='Specific sites to crawl (instead of default list)')
+   parser.add_argument('--content-only', '-c', action='store_true', help='Crawl only content-rich pages (default: True)')
+   parser.add_argument('--all-pages', '-a', action='store_true', help='Crawl all page types, not just content-rich ones')
+   args = parser.parse_args()
+   
+   # Use command line arguments or default values
+   output_file = args.output
+   max_pages = args.max_pages
+   delay = args.delay
+   respect_robots = False if args.ignore_robots else False  # Default to False
+   site_list = args.sites if args.sites else websites
+   content_only = True  # Default to True
+   
+   # Update content_only based on command line arguments
+   if args.all_pages:
+       content_only = False
+       
+   # Update respect_robots based on command line arguments
+   if args.respect_robots:
+       respect_robots = True
+       
+   print(f"Knowledge Base Generator Configuration:")
+   print(f"  - Output file: {output_file}")
+   print(f"  - Max content pages per domain: {max_pages}")
+   print(f"  - Request delay: {delay} seconds")
+   print(f"  - Respect robots.txt: {respect_robots}")
+   print(f"  - Sites to crawl: {len(site_list)}")
+   print(f"  - Content-only mode: {content_only}")
+   
+   start_time = time.time()
+   
+   # Create knowledge base generator
+   generator = KnowledgeBaseGenerator(
+       output_file=output_file,
+       max_pages_per_domain=max_pages,
+       delay=delay,
+       respect_robots=respect_robots,
+       content_only=content_only
+   )
+   
+   # Crawl websites
+   generator.crawl_websites(site_list)
+   
+   # Add metadata
+   generator.add_metadata()
+   
+   # Generate categorical view
+   generator.generate_categories()
+   
+   end_time = time.time()
+   total_time = end_time - start_time
+   minutes = int(total_time // 60)
+   seconds = int(total_time % 60)
+   
+   print(f"\nCrawling completed in {minutes} minutes and {seconds} seconds")
+   print(f"Total pages crawled: {generator.stats['pages_crawled']}")
+   print(f"Total pages skipped: {generator.stats['pages_skipped']}")
+   print(f"Total errors: {generator.stats['errors']}")
+   print(f"Knowledge base saved to: {output_file}")
+   print(f"Categorical view saved to: {os.path.splitext(output_file)[0] + '_categories.json'}")
 
 
 if __name__ == "__main__":
-    main()
+   main()
+
+                    
